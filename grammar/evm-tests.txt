@@ -1,0 +1,18 @@
+sel postStorageForId: int -> [int*int];
+sel emptyListIfNoPostConditionForId: int -> [bool];
+
+test correctValues expect SAT
+    for (!id: int) in ids(),
+    (!b: bool) in emptyListIfNoPostConditionForId(!id)
+    [?stor: array<AbsDom>, ?cd: int]
+    for (!offset: int, !value:int) in postStorageForId(!id): && abseq(select ?stor !offset,@V(!value)),
+    Halt{!id}(?stor, ?cd)
+    ;
+
+test uniqueValues expect UNSAT
+    for (!id: int) in ids(),
+    (!b: bool) in emptyListIfNoPostConditionForId(!id)
+    [?stor: array<AbsDom>, ?cd: int]
+    for (!offset: int, !value:int) in postStorageForId(!id): || absneq(select ?stor !offset,@V(!value)),
+    Halt{!id}(?stor, ?cd)
+    ;

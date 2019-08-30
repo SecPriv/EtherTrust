@@ -1,0 +1,4 @@
+query reentrancyCall for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, CALL) [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int] MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?cd > 0;
+query reentrancyStaticCall for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, STATICCALL) [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int] MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?cd > 0;
+query reentrancyCreate for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, CREATE) [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int] MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?cd > 0;
+query reentrancyCreate2 for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, CREATE2) [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int] MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?cd > 0;

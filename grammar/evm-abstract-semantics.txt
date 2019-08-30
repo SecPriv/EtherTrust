@@ -1,0 +1,945 @@
+//HorSt
+
+/* ============  Selector Functions ============ */
+
+sel interval: int * int -> [int]; // function that gives the interval from m till n-1
+sel ids: unit -> [int]; // gives all contract ids of contracts to be analyzed
+sel pcsForId: int -> [int]; // gives all pcs for a contract with a specific id
+sel lastPcsForId: int -> [int]; // gives the last pc of a contract
+sel pcsForIdAndOpcode: int * int -> [int]; // for a given ID and a Opcode gives all pcs at which this opcode occurs in the specified contract
+sel resultsForIdAndPc: int * int -> [int * int]; // for a given id and pc (from now on referred to as position), gives the precomputed result and the number of elements to be popped from the stac
+sel argumentsZeroForIdAndPc: int * int -> [int]; // gives -1 for for the operations with no result, but zero arguments, used to avoid double generating rules for DUP
+sel argumentsOneForIdAndPc: int * int -> [int]; // gives the first pre-computed argument for the opcode at the specified position. If the argument was not pre-computed it gives -1
+sel argumentsTwoForIdAndPc: int * int -> [int * int]; // gives the first two pre-computed arguments for the opcode at the specified position
+sel argumentsThreeForIdAndPc: int * int -> [int * int * int]; // gives the first two pre-computed arguments for the opcode at the specified position
+sel jumpDestsForIdAndPc: int * int -> [int]; // gives all possible jump destinationsfor a (JUMP/JUMPI) opcode at a specified position
+sel jumpDestUniqueForIdAndPc: int * int -> [bool]; // gives for each position a boolean indicator whether the jump destination at this point is unique or not
+sel binOps: unit -> [int]; // returns the opcodes of all binary operations
+sel unOps: unit -> [int]; // returns the opcodes of all unary operations
+sel terOps: unit -> [int]; // returns the opcodes of all binary operations
+sel unitOps: unit -> [int]; // returns the opcodes of all operations without arguments
+sel copyOps: unit -> [int]; // contains CALLDATACOPY, CODECOPY and RETURNDATA COPY
+
+/* ============ Operations ============ */
+const BITWIDTH := 256;
+
+op pow{!n: int} (a: int): int := for (!i: int) in interval(0, !n) : * a; // at the moment we would need to define the function that gives the interval from 0..n-1
+
+const MAX := pow{32}(256); // 115792089237316195423570985008687907853269984665640564039457584007913129639936
+
+// gives the absolute value of an integer
+op abs (a: int) : int := (a < 0)? (0 - a) : (a); 
+
+// unsigned division (used for normal DIV), EVM division: in case of dividing by 0, the result is 0
+op div (a: int, b:int): int := (b= 0)? (0) : (a/b); 
+
+// EVM version of modulo: this one is more complicated as mod on negative numbers in z3 (smt-lib) and EVM does not coincide
+op emod (a: int, b: int) : int := (b =0)? (0) : ((a < 0)? (0 - (abs(a) mod abs(b))): (a mod abs(b))); 
+op emod2 (a: int, b: int) : int := (b=0)? (0): ((a < 0)? ((a mod b = 0)? (0): (a mod b - abs(b))) : (a mod b)); 
+
+// modulo for positive values (to be used in absmod) 
+op pmod (a: int, b:int) : int := (b=0)? (0): (a mod b);
+
+// bitwise AND
+op bvandh(a: int, b: int): int := for (!n: int) in interval(0, BITWIDTH) : 
+    + pow{!n}(2) * ((a / pow{!n}(2)) mod 2) * ((b / pow{!n}(2)) mod 2);
+
+// bitwise OR
+op bvorh(a: int, b: int): int := for (!n: int) in interval(0, BITWIDTH) :
+    + pow{!n}(2) * ((((a / pow{!n}(2)) mod 2) + ((b / pow{!n}(2)) mod 2) + ((a / pow{!n}(2)) mod 2) * ((b / pow{!n}(2)) mod 2)) mod 2);
+
+// bitwise XOR
+op bvxorh(a: int, b: int): int := for (!n: int) in interval(0, BITWIDTH) :
+    + pow{!n}(2) * ((((a / pow{!n}(2)) mod 2) + ((b / pow{!n}(2)) mod 2)) mod 2);
+
+// bitwise negation
+op bvnegh(a: int): int := for (!n: int) in interval(0, BITWIDTH) :
+    + pow{!n}(2) * ((((a / pow{!n}(2)) mod 2) + 1) mod 2);
+
+// concatenation of two values, with the second value being the integer representation of a bitvector of size !l
+op concat{!l:int}(a:int, b:int): int := a * pow{!l}(256) + b; // Do we need to perform a modulo operation here?
+
+op toSigned (a: int) : int := (a / pow{255}(2)) * (~1) * pow{255}(2) + (a mod pow{255}(2)); //invariant: a is representable by 256bit (unsigned), result is representable by 256bits (signed)
+
+op toUnsigned (a: int) : int := (a < 0)? (pow{255}(2) + pow{255}(2) + a):(a); //invariant: a is representable by 256bit (signed), result is representable by 256bits (unsigned)
+
+op sign(a: int) : int := (a < 0)? (~1) : (1);
+
+op sdiv (a: int, b: int) : int := toUnsigned(sign(toSigned(a)) * sign(toSigned(b)) * div(abs(toSigned(a)), abs(toSigned(b)))); // invariant: a, b representable by 256bits unsigned, so is result
+
+op smod (a: int, b: int) : int := toUnsigned(emod(toSigned(a),toSigned(b)));
+
+op sgt (a: int, b:int) : bool := toSigned(a) > toSigned(b);
+
+op slt (a: int, b: int) : bool := toSigned(a) < toSigned(b);
+
+// Problem with signextend + byte: the position in the value that needs to be accessed is taken from the stack
+op signextend (s: int, v:int): int  :=  // s identifies the maximum byte (counted from the most significant bit) 
+	(s > 30)?
+	(v) :
+	(for (!bp: int) in interval(0, 32) : 
+		+ (
+			(!bp = s + 1)? // byte position on which the most significant bit needs to be accessed (from the right)
+			(
+				v mod (pow{!bp} (256)) // remainder that will not be modified
+				+ 
+				((v mod pow{!bp}(256)) / pow{(!bp*8)-1}(2) = 1)? // test whether most significant bit at the byte position is 1
+				((pow{32-!bp}(256) -1) * pow{!bp}(256)) : // if so all bits above are interpreted as 1
+				(0) // else all bits are interpreted as 0
+			):
+			(0)
+		)
+	);  
+
+op byte (s: int, v: int) : int := 
+	for (!bp: int) in interval(0, 32) : 
+	+ (
+		(!bp = 31 - s)?
+		((v / pow{!bp}(256)) mod 256):
+		(0)
+	);
+
+// logical left shift //(arg2 * 2^arg1) mod 2^256
+// i needs to be in range [0, 255], if it is not the result is 0
+op shl (i:int, v:int): int := 
+	for (!i: int) in interval(0,256) :
+	+ (!i = i)?
+	  ((v * pow{!i}(2)) mod MAX):
+	  (0); 
+
+// logical right shift
+op shr (i: int, v:int): int := 
+	for (!i: int) in interval(0,256) :
+	+ (!i = i)?
+	  (v / pow{!i}(2)):
+	  (0); 
+
+// arithmetic right shift
+// If the shift amount is greater or equal 256 the result is 0 if arg2 is non-negative or -1 if arg2 is negative.
+op sar (i:int, v:int): int :=
+	(for (!i: int) in interval(0, 256) :
+	+ (!i = i)?
+	  (sdiv(v, pow{!i}(2))):
+	  (0))
+	+ (i >= 256 && toSigned(v) < 0)? // ensures that it defaults to -1 or the case of negative v and too big i
+	  (~1):
+	  (0)
+	;
+
+/* ============ Opcodes  ============ */
+const STOP := 0;
+const ADD := 1;
+const MUL := 2;
+const SUB := 3;
+const DIV := 4;
+const SDIV := 5;
+const MOD := 6;
+const SMOD := 7;
+const ADDMOD := 8;
+const MULMOD := 9;
+const EXP := 10;
+const SIGNEXTEND := 11;
+const LT := 16;
+const GT := 17;
+const SLT := 18;
+const SGT := 19;
+const EQ := 20;
+const ISZERO:= 21;
+const AND := 22;
+const OR := 23;
+const XOR := 24;
+const NOT := 25;
+const BYTE := 26;
+const SHL := 27;
+const SHR := 28;
+const SAR := 29;
+const SHA320 := 32;
+const ADDRESS := 48;
+const BALANCE := 49;
+const ORIGIN := 50;
+const CALLER := 51;
+const CALLVALUE := 52;
+const CALLDATALOAD := 53;
+const CALLDATASIZE := 54;
+const CALLDATACOPY := 55;
+const CODESIZE := 56;
+const CODECOPY := 57;
+const GASPRICE := 58;
+const EXTCODESIZE := 59;
+const EXTCODECOPY := 60;
+const RETURNDATASIZE := 61;
+const RETURNDATACOPY := 62;
+const EXTCODEHASH := 63;
+const BLOCKHASH := 64;
+const COINBASE := 65;
+const TIMESTAMP := 66;
+const NUMBER := 67;
+const DIFFICULTY := 68;
+const GASLIMIT := 69;
+const POP := 80;
+const MLOAD := 81;
+const MSTORE := 82;
+const MSTORE8 := 83;
+const SLOAD := 84;
+const SSTORE := 85;
+const JUMP := 86;
+const JUMPI := 87;
+const PC := 88;
+const MSIZE := 89;
+const GAS := 90;
+const JUMPDEST:= 91;
+const PUSH1 := 96;
+const DUP1 := 128;
+const SWAP1 := 144;
+const LOG0 := 160;
+const LOG1 := 161;
+const LOG2 := 162;
+const LOG3 := 163;
+const LOG4 := 164;
+const CREATE := 240;
+const CALL := 241;
+const CALLCODE := 242;
+const RETURN := 243;
+const DELEGATECALL := 244;
+const CREATE2 := 245; 
+const STATICCALL := 250;
+const REVERT := 253;
+const INVALID := 254;
+const SELFDESTRUCT := 255;
+
+datatype Opcode := @STOP | @ADD | @MUL | @SUB | @DIV | @SDIV | @MOD | @SMOD | @ADDMOD | @MULMOD | @EXP | @SIGNEXTEND | @LT | @GT | @SLT | @SGT | @EQ | @ISZERO | @AND | @OR | @XOR | @NOT | @BYTE | @SHL | @SHR | @SAR 
+| @SHA | @ADDRESS | @BALANCE | @ORIGIN | @CALLER | @CALLVALUE | @CALLDATALOAD | @CALLDATASIZE | @CALLDATACOPY | @CODESIZE | @CODECOPY | @GASPRICE | @EXTCODESIZE | @EXTCODECOPY | @RETURNDATASIZE | @RETURNDATACOPY | @EXTCODEHASH | @BLOCKHASH | @COINBASE
+| @TIMESTAMP | @NUMBER | @DIFFICULTY | @GASLIMIT | @POP | @MLOAD | @MSTORE | @MSTOREEIGHT | @SLOAD | @SSTORE | @JUMP | @JUMPI | @PC | @MSIZE | @GAS | @JUMPDEST | @PUSH<int> | @SWAP<int> | @DUP<int> | @LOG<int> | @CREATE
+| @CALL | @CALLCODE  | @RETURN | @DELEGATECALL | @CREATETWO | @STATICCALL | @REVERT | @INVALID |@SELFDESTRUCT;
+
+op opCodeToInt (c: Opcode): int := match c with 
+|@STOP => STOP | @ADD => ADD | @MUL => MUL | @SUB => SUB | @DIV => DIV | @SDIV => SDIV | @MOD => MOD | @SMOD => SMOD | @ADDMOD => ADDMOD | @MULMOD => MULMOD| @EXP => EXP| @SIGNEXTEND => SIGNEXTEND 
+| @LT => LT | @GT => GT | @SLT => SLT | @SGT => SGT | @EQ => EQ | @ISZERO => ISZERO | @AND => AND | @OR => OR | @XOR => XOR | @NOT => NOT | @BYTE => BYTE | @SHL => SHL | @SHR => SHR | @SAR => SAR 
+| @SHA => SHA320 | @ADDRESS => ADDRESS | @BALANCE => BALANCE | @ORIGIN => ORIGIN | @CALLER => CALLER | @CALLVALUE => CALLVALUE| @CALLDATALOAD => CALLDATALOAD| @CALLDATASIZE => CALLDATASIZE
+| @CALLDATACOPY => CALLDATACOPY | @CODESIZE => CODESIZE | @CODECOPY => CODECOPY | @GASPRICE => GASPRICE | @EXTCODESIZE => EXTCODESIZE | @EXTCODECOPY => EXTCODECOPY | @RETURNDATASIZE => RETURNDATASIZE| @RETURNDATACOPY => RETURNDATACOPY
+| @EXTCODEHASH => EXTCODEHASH | @BLOCKHASH => BLOCKHASH| @COINBASE => COINBASE | @TIMESTAMP => TIMESTAMP | @NUMBER => NUMBER | @DIFFICULTY => DIFFICULTY | @GASLIMIT => GASLIMIT | @POP => POP | @MLOAD => MLOAD | @MSTORE => MSTORE
+| @MSTOREEIGHT => MSTORE8 | @SLOAD => SLOAD | @SSTORE => SSTORE | @JUMP => JUMP | @JUMPI => JUMPI | @PC => PC | @MSIZE => MSIZE | @GAS => GAS | @JUMPDEST => JUMPDEST 
+| @PUSH(i) => PUSH1 + i -1 
+| @SWAP(i) =>  SWAP1 + i -1 
+| @DUP(i) =>  DUP1 + i -1 
+| @LOG(i) => LOG0 + i 
+| @CREATE => CREATE | @CALL => CALL | @CALLCODE => CALLCODE | @RETURN => RETURN | @DELEGATECALL => DELEGATECALL | @CREATETWO => CREATE2 | @STATICCALL => STATICCALL | @REVERT => REVERT | @INVALID => INVALID | @SELFDESTRUCT => SELFDESTRUCT | _ => 0;
+
+op intToOpCode (i:int): Opcode := 
+	(i = STOP)? 
+	(@STOP):
+	((i = ADD)?
+		(@ADD):
+		((i = MUL)?
+			(@MUL):
+			((i = SUB)?
+				(@SUB):
+				((i= DIV)?
+					(@DIV):
+					((i= SDIV)?
+						(@SDIV):
+						((i = MOD)?
+							(@MOD):
+							((i = SMOD)?
+								(@SMOD):
+								((i = ADDMOD)?
+									(@ADDMOD):
+									((i =MULMOD)?
+										(@MULMOD):
+										((i= EXP)?
+											(@EXP):
+											((i = SIGNEXTEND)?
+												(@SIGNEXTEND):
+												((i= LT)?
+													(@LT):
+													((i= GT)?
+														(@GT):
+														((i= SLT)?
+															(@SLT):
+															((i = SGT)?
+																(@SGT):
+																((i = EQ)?
+																	(@EQ):
+																	((i = ISZERO)?
+																		(@ISZERO):
+																		((i = AND)?
+																			(@AND):
+																			((i= OR)?
+																				(@OR):
+																				((i = XOR)? 
+																					(@XOR):
+																					((i = NOT)?
+																						(@NOT):
+																						((i = BYTE)?
+																							(@BYTE):
+																							((i = SHL)?
+																								(@SHL):
+																								((i = SHR)?
+																									(@SHR):
+																									((i = SAR)?
+																										(@SAR):
+																										((i = SHA320)?
+																											(@SHA):
+																											((i = ADDRESS)?
+																												(@ADDRESS):
+																												((i = BALANCE)?
+																													(@BALANCE):
+																													((i = ORIGIN)?
+																														(@ORIGIN):
+																														((i = CALLER)?
+																															(@CALLER):
+																															((i = CALLVALUE)?
+																																(@CALLVALUE):
+																																((i = CALLDATALOAD)?
+																																	(@CALLDATALOAD):
+																																	((i = CALLDATASIZE)?
+																																		(@CALLDATASIZE):
+																																		((i = CALLDATACOPY)?
+																																			(@CALLDATACOPY):
+																																			((i = CODESIZE)?
+																																				(@CODESIZE): 
+																																				((i = CODECOPY)?
+																																					(@CODECOPY):
+																																					((i = GASPRICE)?
+																																						(@GASPRICE):
+																																						((i = EXTCODECOPY)?
+																																							(@EXTCODECOPY):
+																																							((i = RETURNDATASIZE)?
+																																								(@RETURNDATASIZE):
+																																								((i = RETURNDATACOPY)?
+																																									(@RETURNDATACOPY):
+																																									((i = BLOCKHASH)?
+																																										(@BLOCKHASH):
+																																										((i = COINBASE)?
+																																											(@COINBASE):
+																																											((i = TIMESTAMP)? 
+																																												(@TIMESTAMP):
+																																												((i = NUMBER)?
+																																													(@NUMBER):
+																																													((i = DIFFICULTY)?
+																																														(@DIFFICULTY):
+																																														((i = GASLIMIT)?
+																																															(@GASLIMIT):
+																																															((i = POP)?
+																																																(@POP):
+																																																((i = MLOAD)?
+																																																	(@MLOAD):
+																																																	((i = MSTORE)?
+																																																		(@MSTORE):
+																																																		((i = MSTORE8)?
+																																																			(@MSTOREEIGHT):
+																																																			((i = SLOAD)?
+																																																				(@SLOAD):
+																																																				((i = SSTORE)?
+																																																					(@SSTORE):
+																																																					((i = JUMP)?
+																																																						(@JUMP):
+																																																						((i = JUMPI)?
+																																																							(@JUMPI):
+																																																							((i = PC)?
+																																																								(@PC):
+																																																								((i = MSIZE)?
+																																																									(@MSIZE):
+																																																									((i = GAS)?
+																																																										(@GAS):
+																																																										((i = JUMPDEST)?
+																																																											(@JUMPDEST):
+																																																											((i >= PUSH1 && i <= PUSH1+31)?
+																																																												(@PUSH(i - PUSH1 + 1)):
+																																																												((i >= SWAP1 && i <= SWAP1 + 15)?
+																																																													(@SWAP(i - SWAP1 + 1)):
+																																																													((i >= DUP1 && i <= DUP1 + 15)?
+																																																														(@DUP(i- DUP1 + 1)):
+																																																														(( i >= LOG0 && i <= LOG0 +4)?
+																																																															(@LOG(i - LOG0)):
+																																																															(( i = CREATE)? 
+																																																																(@CREATE):
+																																																																((i = CALL)?
+																																																																	(@CALL):
+																																																																	((i = CALLCODE)?
+																																																																		(@CALLCODE):
+																																																																		((i = RETURN)?
+																																																																			(@RETURN):
+																																																																			((i = DELEGATECALL)? 
+																																																																				(@DELEGATECALL):
+																																																																				((i = STATICCALL)?
+																																																																					(@STATICCALL):
+																																																																					((i = REVERT)?
+																																																																						(@REVERT):
+																																																																						((i = INVALID)?
+																																																																							(@INVALID):
+																																																																							((i = SELFDESTRUCT)?
+																																																																								(@SELFDESTRUCT):
+																																																																								((i = CREATE2)?
+																																																																									(@CREATETWO):
+																																																																									((i = EXTCODEHASH)?
+																																																																										(@EXTCODEHASH):
+																																																																										((i = EXTCODESIZE)? 
+																																																																											(@EXTCODESIZE):
+																																																																											(@STOP)
+
+																																																																											)
+																																																																										)
+																																																																									)
+																																																																								)
+																																																																							)
+																																																																						)
+																																																																					)
+																																																																				)
+																																																																			)
+																																																																		)
+																																																																	)
+																																																																)
+																																																															)
+																																																														)
+																																																													)
+																																																												)
+																																																											)
+																																																										)
+																																																									)
+																																																								)
+																																																							)
+))))))))))))))))))))))))))))))))))))))))))))))))))))); 
+
+/* ============  Abstract Domain and Abstract Operations ============ */
+
+eqtype AbsDom := @T | @V<int>; /* Abstract Domain */
+
+op isConcrete(a:AbsDom): bool := match a with | @T => false | _ => true;  
+op extractConcrete(a:AbsDom): int := match a with | @V(x) => x | _ => 0;
+
+/* ===== Abstract Operations ===== */
+
+op concatAbs{!l:int}(a:AbsDom, b:AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V(concat{!l}(x, y)) | _ => @T;
+op absadd(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V((x + y) mod MAX) | _ => @T;
+op absmul(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V((x * y) mod MAX) | _ => @T;
+op absdiv(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V(div(x, y)) | _ => @T; // Not that the mod MAX is not needed here as no overflow can happen if the arguments are in bounds
+op abssub(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V((x - y) mod MAX) | _ => @T;
+op absandb(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V(bvandh(x, y)) | _ => @T;
+op absorb(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V(bvorh(x, y)) | _ => @T;
+op absxorb(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V(bvxorh(x, y)) | _ => @T;
+op absnegb(a:AbsDom): AbsDom := match a with | @V(x) => @V(bvnegh(x)) | _ => @T;
+op absmod(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V(pmod(x, y)) | _ => @T;
+op absaddmod(a: AbsDom, b: AbsDom, c: AbsDom): AbsDom := match (a, b, c) with | (@V(x), @V(y), @V(z)) => @V(pmod((x + y), z) mod MAX) | _ => @T; // Similiar to div here no overflows can happen
+op absmulmod(a: AbsDom, b: AbsDom, c: AbsDom): AbsDom := match (a, b, c) with | (@V(x), @V(y), @V(z)) => @V(pmod((x * y), z) mod MAX) | _ => @T;
+op abseq(a:AbsDom, b:AbsDom): bool := match (a, b) with | (@V(x), @V(y)) => x = y | _ => true;
+op absneq(a:AbsDom, b:AbsDom): bool := match (a, b) with | (@V(x), @V(y)) => x != y | _ => true;
+op absgtb(a: AbsDom, b: AbsDom): bool := match (a, b) with | (@V(x), @V(y)) => x > y | _ => true; // TODO at the moment the naming is inconsistent! abseq returns bool, abseqb AbsDom, the other way around for absgt/absgtb
+op abseqb(a:AbsDom, b:AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => (x = y) ? (@V(1)) : (@V(0)) | _ => @T;
+op abslt(a:AbsDom, b:AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => (x < y) ? (@V(1)) : (@V(0)) | _ => @T;
+op absgt(a:AbsDom, b:AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => (x > y) ? (@V(1)) : (@V(0)) | _ => @T;
+op absiszero(a:AbsDom): AbsDom := match a with | @V(x) => (x = 0) ? (@V(1)) : (@V(0)) | _ => @T;
+op absshl(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V((shl(x, y)) mod MAX) | _ => @T;
+op absshr(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V((shr(x, y)) mod MAX) | _ => @T;
+op abssar(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V((sar(x, y)) mod MAX) | _ => @T;
+op abssmod(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V(smod (x,y)) | _ => @T;
+op abssdiv(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V(sdiv (x,y)) | _ => @T;
+op abssgt(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => (sgt (x,y)) ? (@V(1)) : (@V(0)) | _ => @T;
+op absslt(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => (slt (x,y)) ? (@V(1)) : (@V(0)) | _ => @T;
+op abssignextend(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V(signextend (x,y)) | _ => @T;
+op absbyte(a: AbsDom, b: AbsDom): AbsDom := match (a, b) with | (@V(x), @V(y)) => @V(byte (x,y)) | _ => @T;
+
+/* over-approximations */
+op absexp(a: AbsDom, b: AbsDom): AbsDom := @T;
+op sha320(a: AbsDom, b: AbsDom): AbsDom := @T;
+
+/* ============  Predicates ============ */
+pred MState{int*int}: int * array<AbsDom> * array<AbsDom> * array<AbsDom>  * int; // <id, pc>: size, stack, memory, storage, cd 
+pred Exc{int}: int; // cd, predicate signalizing exceptional halting
+pred Halt{int}: array<AbsDom> * int; // <id>: storage, cd /* halting state */
+
+/* ============ Rules ========== */
+
+/* === Exception Rules === */
+
+// General exception rule that is the same for all pcs 
+rule exception := 
+	for (!id: int) in ids(), (!pc: int) in pcsForId(!id)
+	clause [?size: int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd)
+		=> Exc{!id}(?cd);
+
+/* === Concrete Rules === */
+
+// General rule for all opcodes that have concrete results (for the next pc) computed
+rule concrete := 
+  for (!id: int) in ids(), (!pc: int) in pcsForId(!id), (!res:int , !n:int) in resultsForIdAndPc(!id, !pc)
+  	clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd)
+		=> MState{!id, !pc +1}(?size-(!n -1), store ?sa (?size-!n) (@V(!res)), ?mem, ?stor, ?cd); 
+
+
+op tryConcrete{!c:int}(val:AbsDom): AbsDom := 
+	(!c = ~1)? (val): (@V(!c)); 
+
+/* === Binary Operations === */
+
+op binOp(c:Opcode, x: AbsDom, y: AbsDom): AbsDom := match c with 
+| @ADD => absadd(x, y)
+| @MUL => absmul(x, y)
+| @SUB => abssub(x, y)
+| @DIV => absdiv(x, y)
+| @SDIV => abssdiv(x, y)
+| @MOD => absmod(x, y)
+| @SMOD => abssmod(x, y)
+| @LT => abslt(x, y)
+| @GT => absgt(x, y)
+| @SLT => absslt(x, y)
+| @SGT => abssgt(x, y)
+| @EQ => abseqb(x, y)
+// | @AND => absandb(x, y) // AND has a special rule! 
+// | @OR => absorb(x, y) // OR has a special rule! 
+| @XOR => absxorb(x, y)
+| @BYTE => absbyte(x, y)
+| @SIGNEXTEND => abssignextend(x, y)
+| @SHL => absshl(x, y)
+| @SHR => absshr(x, y)
+| @SAR => abssar(x, y)
+| @EXP => absexp(x, y)
+| @SHA => @T
+| _ => @T;
+
+// TODO: extension to hybrid rules
+rule opBin :=
+	for (!op: int) in binOps(), (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, !op), (!a:int, !b: int) in argumentsTwoForIdAndPc(!id, !pc) 
+	clause [?x: AbsDom, ?y:AbsDom, ?size: int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 1, 
+		?x = tryConcrete{!a} (select ?sa (?size -1)),
+		?y = tryConcrete{!b} (select ?sa (?size -2))
+		=> MState{!id, !pc +1}(?size -1, store ?sa (?size -2) (binOp(intToOpCode(!op), ?x,?y)), ?mem, ?stor, ?cd);
+
+/* == Special Cases == */
+
+/* = AND = */
+
+rule opAnd:= 
+	for (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, AND), (!a:int, !b:int) in argumentsTwoForIdAndPc(!id, !pc)
+	let
+		macro #StackSizeCheck := MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 1
+	in
+	clause [?x: AbsDom, ?y: AbsDom, ?r: AbsDom, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		#StackSizeCheck, !a != ~1, !b = ~1, // case that the left operand is known: it is checked whether this one is a byte mask
+		?y = select ?sa (?size -2), 
+		for (!o: int) in interval(0, 32), (!s: int) in interval(0, 33-!o): // for all bytes it is checked whether !a is the corresponding byte mask, if so the corresponding assignment to the simplified computation is done
+			&& ((!a = (pow{!s}(256) -1)* pow{!o}(256))? (?r = absmul(absmod(absdiv(?y, @V(pow{!o}(256))), @V(pow{!s}(256))), @V(pow{!o}(256)))): (true)), 
+		(for (!o: int) in interval(0, 32), (!s: int) in interval(0, 33-!o): // if !a ia not any valid byte mask then the standard operation is done 
+			&& (!a != (pow{!s}(256) -1)* pow{!o}(256)))?
+		((?r = absandb(@V(!a), ?y))):
+		(true)
+		=> MState{!id, !pc +1}(?size-1, store ?sa (?size-2) ?r, ?mem, ?stor, ?cd), 
+	clause [?x: AbsDom, ?y: AbsDom, ?r: AbsDom, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		#StackSizeCheck, !a = ~1, !b != ~1,  // case that the right operand is known, it is checked whether it of the form 0^{x*8}1^{y*8} (with x + y = 32)
+		?x = select ?sa (?size -1), 
+		for (!i: int) in interval(0, 32) : && ((!b = pow{!i}(256) -1)? (?r = absmod (?x, @V(pow{!i}(256)))): (true)), 
+		(for (!i: int) in interval(0, 32): && (!b != pow{!i}(256) -1))? (?r = absandb(?x, @V(!b))): (true)
+		=> MState{!id, !pc +1}(?size-1, store ?sa (?size-2) ?r, ?mem, ?stor, ?cd), 
+	clause [?x: AbsDom, ?y: AbsDom, ?r: AbsDom, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		#StackSizeCheck, !a = ~1, !b = ~1, 
+		?x = select ?sa (?size -1), 
+		?y = select ?sa (?size -2), 
+		?r = absandb(?x, ?y) 
+		=> MState{!id, !pc +1}(?size-1, store ?sa (?size-2) ?r, ?mem, ?stor, ?cd);
+
+/* = OR = */
+
+rule opOr := 
+	for (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, OR), (!a:int, !b:int) in argumentsTwoForIdAndPc(!id, !pc)
+	let
+		macro #StackSizeCheck := MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 1
+	in
+	clause [?x: AbsDom, ?y: AbsDom, ?r: AbsDom, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		#StackSizeCheck, !a != ~1, !b = ~1, // !a is known and !b is unknown
+		?y = select ?sa (?size -2), 
+		(for (!o: int) in interval(0, 32), (!s: int) in interval(0, 33-!o):
+			|| (
+					(abseq(
+						absmod(
+							absdiv(?y, @V(pow{!o}(256))), 
+							@V(pow{!s}(256))
+						), 
+						@V(0)
+						)
+					)
+					&& 
+					(!a mod (pow{!o}(256)) = 0)
+					&& 
+					(!a / (pow{!o+!s}(256)) = 0)
+				)
+		)? 
+		(?r = absadd(@V(!a), ?y)):
+		(?r = absorb(@V(!a), ?y))
+		=> MState{!id, !pc +1}(?size-1, store ?sa (?size-2) ?r, ?mem, ?stor, ?cd),
+	clause [?x: AbsDom, ?y: AbsDom, ?r: AbsDom, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		#StackSizeCheck, !a = ~1, !b != ~1, // !a is unknown and !b is known
+		?x = select ?sa (?size -1), 
+		(for (!o: int) in interval(0, 32), (!s: int) in interval(0, 33-!o):
+			|| (
+					(abseq(
+						absmod(
+							absdiv(?x, @V(pow{!o}(256))), 
+							@V(pow{!s}(256))
+						), 
+						@V(0)
+						)
+					)
+					&& 
+					(!b mod (pow{!o}(256)) = 0)
+					&& 
+					(!b / (pow{!o+!s}(256)) = 0)
+				)
+		)? 
+		(?r = absadd(@V(!b), ?x)):
+		(?r = absorb(@V(!b), ?x))
+		=> MState{!id, !pc +1}(?size-1, store ?sa (?size-2) ?r, ?mem, ?stor, ?cd),
+	clause [?x: AbsDom, ?y: AbsDom, ?r: AbsDom, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		#StackSizeCheck, !a = ~1, !b = ~1, // !a and !b are unknown
+		?x = select ?sa (?size -1),
+		?y = select ?sa (?size -2),  
+		(for (!o: int) in interval(0, 32), (!s: int) in interval(0, 33-!o): 
+			|| (
+					(abseq(
+						absmod(
+							absdiv(?y, @V(pow{!o}(256))), 
+							@V(pow{!s}(256))
+						), 
+						@V(0)
+						)
+					)
+					&& 
+					(abseq(absmod(?x, @V(pow{!o}(256))), @V(0)))
+					&& 
+					(abseq(absdiv(?x, @V(pow{!o+!s}(256))), @V(0)))
+				)
+		)? 
+		(?r = absadd(?x, ?y)):
+		(?r = absorb(?x, ?y))
+		=> MState{!id, !pc +1}(?size-1, store ?sa (?size-2) ?r, ?mem, ?stor, ?cd);
+	
+/* === Unary Operations === */
+
+op unOp(c:Opcode, x: AbsDom): AbsDom := match c with 
+| @NOT => absnegb(x)
+| @ISZERO => absiszero(x)
+| @BALANCE => @T 
+| @CALLDATALOAD => @T
+| @CODESIZE => @T
+| @BLOCKHASH => @T
+| @EXTCODEHASH => @T
+| _ => @T;
+
+rule opUn :=
+	for (!op: int) in unOps(), (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, !op), (!a: int) in argumentsOneForIdAndPc(!id, !pc) 
+	clause [?x: AbsDom, ?size: int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 0, 
+		?x = tryConcrete{!a}(select ?sa (?size -1))
+		=> MState{!id, !pc +1}(?size, store ?sa (?size -1) (unOp(intToOpCode(!op), ?x)), ?mem, ?stor, ?cd);
+
+/* === Ternary Operations === */
+
+op terOp(c:Opcode, x: AbsDom, y: AbsDom, z:AbsDom): AbsDom := match c with 
+| @ADDMOD => absaddmod(x, y, z)
+| @MULMOD => absmulmod(x, y, z)
+| _ => @T;
+
+rule opTer :=
+	for (!op: int) in terOps(), (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, !op), (!a: int, !b: int, !c:int) in argumentsThreeForIdAndPc(!id, !pc)
+	clause [?x: AbsDom, ?y:AbsDom, ?z: AbsDom, ?size: int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 2,
+		?x = tryConcrete{!a} (select ?sa (?size -1)),
+		?y = tryConcrete{!b} (select ?sa (?size -2)),
+		?z = tryConcrete{!c} (select ?sa (?size -3))
+		=> MState{!id, !pc +1}(?size -2, store ?sa (?size -3) (terOp(intToOpCode(!op), ?x,?y, ?z)), ?mem, ?stor, ?cd);
+
+/* === Stack Operations === */
+
+rule opDup := 
+	for (!os: int) in interval(1, 17), (!id:int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, DUP1 + !os -1), (!z:int) in argumentsZeroForIdAndPc(!id, !pc)
+	clause [?size: int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int, ?v: AbsDom]
+		MState{!id, !pc}(?size, ?sa , ?mem, ?stor, ?cd), 
+		?v = select ?sa (?size - !os), ?size >= !os, ?size < 1024   
+		=> MState{!id, !pc+1}(?size + 1, store ?sa ?size ?v, ?mem, ?stor, ?cd); 
+
+rule opSwap := 
+	for (!os: int) in interval(1, 17), (!id:int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, SWAP1 + !os -1), (!a: int, !b: int) in argumentsTwoForIdAndPc(!id, !pc)
+	clause [?size: int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int, ?v1: AbsDom, ?v2: AbsDom]
+		MState{!id, !pc}(?size, ?sa , ?mem, ?stor, ?cd), 
+		?v1 = tryConcrete{!b}(select ?sa (?size - !os -1)),
+		?v2 = tryConcrete{!a}(select ?sa (?size -1)), 
+		?size > !os 
+		=> MState{!id, !pc+1}(?size, store (store ?sa (?size -1) ?v1) (?size- !os - 1) ?v2, ?mem, ?stor, ?cd); 
+
+rule opPush :=
+	for (!id: int) in ids(), (!os: int) in interval(1, 33), (!pc: int) in pcsForIdAndOpcode(!id, PUSH1 + !os - 1), (!v:int) in argumentsOneForIdAndPc(!id, !pc) // the argument should never be -1!
+	clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size < 1024
+		=> MState{!id, !pc + !os + 1}(?size +1, store ?sa ?size (@V(!v)), ?mem, ?stor, ?cd);
+
+rule opPop :=
+	for (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, POP)
+	clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 0
+		=> MState{!id, !pc +1}(?size-1, ?sa, ?mem, ?stor, ?cd);
+
+/* === JUMPING === */
+
+rule opJump := 
+	for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, JUMP), (!j: int) in jumpDestsForIdAndPc(!id, !pc), (!b: bool) in jumpDestUniqueForIdAndPc(!id, !pc)
+	clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 0, 
+		(!b)? (true): (abseq(select ?sa (?size - 1), @V(!j))) // if the jump destination is not unique an additional guard is introduced for checking whether one can really jump to the target
+		=> MState{!id, !j}(?size-1, ?sa, ?mem, ?stor, ?cd);
+
+rule opJumpiTrue := 
+	for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, JUMPI), (!j: int) in jumpDestsForIdAndPc(!id, !pc), (!b: bool) in jumpDestUniqueForIdAndPc(!id, !pc), (!a:int) in argumentsOneForIdAndPc(!id, !pc)
+	clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int, ?b: AbsDom]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 1, 
+		(!b)? (true): (abseq(select ?sa (?size - 1), @V(!j))), // if the jump destination is not unique an additional guard is introduced for checking whether one can really jump to the target
+		?b = tryConcrete{!a}(select ?sa (?size -2)), 
+		absneq(?b, @V(0))
+		=> MState{!id, !j}(?size-2, ?sa, ?mem, ?stor, ?cd);
+
+rule opJumpiFalse := // in the case that the condition is false, a step to the next pc is done (independently on the jump targets that were pre-computed)
+	for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, JUMPI), (!a: int) in argumentsOneForIdAndPc(!id, !pc)
+	clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int, ?b: AbsDom]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 1, 
+		?b = tryConcrete{!a}(select ?sa (?size -2)), 
+		abseq(?b, @V(0))
+		=> MState{!id, !pc + 1}(?size-2, ?sa, ?mem, ?stor, ?cd);
+
+rule opJumpDest := 
+	for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, JUMPDEST)
+	clause [?size: int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int]
+		MState{!id,!pc}(?size, ?sa, ?mem, ?stor, ?cd)
+		=> MState{!id, !pc +1}(?size, ?sa, ?mem, ?stor, ?cd); 
+
+/* === Memory Operations === */
+
+// extracts the nth byte (from the right)
+op extractByteR{!n:int}(w: int): int := (w / pow{!n}(256)) mod 256;
+// extracts the nth byte (from the left) assumes !n to be in [0,31]
+op extractByteL{!n:int}(w:int): int := extractByteR{31-!n}(w); 
+op absExtractByteL{!n: int}(w: AbsDom): AbsDom := match w with | @V(x) => @V(extractByteL{!n}(x))| _ => @T;
+op valToMemWord (v: AbsDom, mem: array<AbsDom>, o: int): array<AbsDom> :=
+    for (!a : int) in interval(0, 32): x : array<AbsDom> -> store x (o + !a) (absExtractByteL{!a}(v)), mem;
+
+rule opMstore := 
+	for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, MSTORE), (!p: int, !v: int) in argumentsTwoForIdAndPc(!id, !pc)
+		clause [?size: int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int, ?offset: AbsDom, ?p: int, ?v: AbsDom]
+			MState{!id,!pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 1,
+			(!p = ~1)? ((?offset = select ?sa (?size -1)) && isConcrete(?offset) && (?p = extractConcrete(?offset))): (?p = !p), // if !p is unknown it is taken from the stack and concretized if possible
+			?v = tryConcrete{!v}(select ?sa (?size -2))// if the value is not known it's selected from the stack, otherwise it is the concrete value known
+			=> MState{!id, !pc +1}(?size - 2, ?sa, valToMemWord(?v, ?mem, ?p), ?stor, ?cd),
+		clause [?size: int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int, ?offset: AbsDom]
+			MState{!id,!pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 1,
+			!p = ~1, ?offset = select ?sa (?size -1), ~isConcrete(?offset) // case in which no concrete offset can be derived
+			=> MState{!id, !pc +1}(?size - 2, ?sa, [@T], ?stor, ?cd);
+
+rule opMstore8 := 
+	for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, MSTORE8), (!p: int, !v: int) in argumentsTwoForIdAndPc(!id, !pc)
+		clause [?size: int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int, ?offset: AbsDom, ?p: int, ?v: AbsDom, ?w: AbsDom]
+			MState{!id,!pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 1,
+			(!p = ~1)? ((?offset = select ?sa (?size -1)) && isConcrete(?offset) && (?p = extractConcrete(?offset))): (?p = !p), // if !p is unknown it is taken from the stack and concretized if possible
+			?v = tryConcrete{!v}(select ?sa (?size -2)), // if the value is not known it's selected from the stack, otherwise it is the concrete value known
+			?w = absmod(?v, @V(256))
+			=> MState{!id, !pc +1}(?size - 2, ?sa, store ?mem ?p ?w, ?stor, ?cd),
+		clause [?size: int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int, ?offset: AbsDom]
+			MState{!id,!pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 1,
+			!p = ~1, ?offset = select ?sa (?size -1), ~isConcrete(?offset) // case in which no concrete offset can be derived
+			=> MState{!id, !pc +1}(?size - 2, ?sa, [@T], ?stor, ?cd);
+
+rule opMload := 
+	for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, MLOAD), (!p: int) in argumentsOneForIdAndPc(!id, !pc)
+	let
+    	macro #StackSizeCheck := MState{!id,!pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 0
+    in
+    clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?v: AbsDom, ?offset:AbsDom, ?size:int, ?cd: int, ?p:int]
+    	#StackSizeCheck,
+    	(!p = ~1)? ((?offset = select ?sa (?size -1)) && isConcrete(?offset) && (?p = extractConcrete(?offset))): (?p = !p), 
+   		?v = for (!i: int) in interval (0, 32): x : AbsDom -> 
+    			absadd(x, absmul(select ?mem (?p + !i), @V(pow{31-!i}(256)))), @V(0) 
+    	=> MState{!id, !pc + 1}(?size, store ?sa (?size - 1) ?v, ?mem, ?stor, ?cd),
+    clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?v: AbsDom, ?offset:AbsDom, ?size:int, ?cd: int, ?p:int]
+    	#StackSizeCheck, 
+    	!p = ~1, ?offset = select ?sa (?size -1), ~isConcrete(?offset)
+    	=> MState{!id, !pc + 1}(?size, store ?sa (?size - 1) @T, ?mem, ?stor, ?cd); 
+
+
+/* === Storage Operations === */
+
+rule opStore := 
+	for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, SSTORE), (!p: int, !v: int) in argumentsTwoForIdAndPc(!id, !pc)
+	let
+    	macro #StackSizeCheck := MState{!id,!pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 1
+    in
+	clause [?size: int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int, ?offset: AbsDom, ?p: int, ?v: AbsDom]
+		#StackSizeCheck,
+		(!p = ~1)? ((?offset = select ?sa (?size -1)) && isConcrete(?offset) && (?p = extractConcrete(?offset))): (?p = !p), // if !p is unknown it is taken from the stack and concretized if possible
+		?v = tryConcrete{!v} (select ?sa (?size -2))// if the value is not known it's selected from the stack, otherwise it is the concrete value known
+		=> MState{!id, !pc +1}(?size - 2, ?sa, ?mem, store ?stor ?p ?v, ?cd),
+	clause [?size: int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int, ?offset: AbsDom, ?v: AbsDom]
+		#StackSizeCheck, 
+		!p = ~1, ?offset = select ?sa (?size -1), ~isConcrete(?offset) // case in which no concrete offset can be derived
+		=> MState{!id, !pc +1}(?size - 2, ?sa, ?mem, [@T], ?cd);
+
+
+rule opSload := 
+	for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, SLOAD), (!p: int) in argumentsOneForIdAndPc(!id, !pc)
+	let
+    	macro #StackSizeCheck := MState{!id,!pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 0
+    in
+    clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?v: AbsDom, ?offset:AbsDom, ?size:int, ?cd: int, ?p:int]
+    	#StackSizeCheck,
+    	(!p = ~1)? ((?offset = select ?sa (?size -1)) && isConcrete(?offset) && (?p = extractConcrete(?offset))): (?p = !p), 
+   		?v = select ?stor ?p 
+    	=> MState{!id, !pc + 1}(?size, store ?sa (?size - 1) ?v, ?mem, ?stor, ?cd),
+    clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?v: AbsDom, ?offset:AbsDom, ?size:int, ?cd: int, ?p:int]
+    	#StackSizeCheck, 
+    	!p = ~1, ?offset = select ?sa (?size -1), ~isConcrete(?offset)
+    	=> MState{!id, !pc + 1}(?size, store ?sa (?size - 1) @T, ?mem, ?stor, ?cd); 
+
+/* === Transaction initiating operations === */
+
+rule opCall := 
+	for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, CALL), (!a: int, !b: int) in argumentsTwoForIdAndPc(!id, !pc)
+	let 	
+		macro #StackSizeCheck := MState{!id,!pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 6
+    in
+    clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		#StackSizeCheck
+		=> MState{!id, !pc + 1}(?size - 6, store ?sa (?size-7) @T, [@T], [@T], ?cd),
+	clause [?v :AbsDom, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int, ?cdp:int]
+    	#StackSizeCheck, ?cdp > ?cd, absgtb(select ?sa (?size - 2), @V(8)), // contracts 1-8 are precompiled, 0 is an account, calling there won't call a callback
+    	absgtb(select ?sa (?size -1), @V(0))// assumption: contracts with 0 gas can't call back => they only get the gasstipend which should not be sufficient
+    	=> MState{!id, 0}(0, [@V(0)], [@V(0)], ?stor, ?cdp);
+
+rule opStaticcall := 
+	for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, STATICCALL), (!a: int, !b: int) in argumentsTwoForIdAndPc(!id, !pc)
+	let 	
+		macro #StackSizeCheck := MState{!id,!pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 5
+    in
+    clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		#StackSizeCheck
+		=> MState{!id, !pc + 1}(?size - 5, store ?sa (?size-6) @T, [@T], [@T], ?cd),
+	clause [?v :AbsDom, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int, ?cdp:int]
+    	#StackSizeCheck, ?cdp > ?cd, absgtb(select ?sa (?size - 2), @V(8)), // contracts 1-8 are precompiled, 0 is an account, calling there won't call a callback
+    	absgtb(select ?sa (?size -1), @V(0))// assumption: contracts with 0 gas can't call back => they only get the gasstipend which should not be sufficient
+    	=> MState{!id, 0}(0, [@V(0)], [@V(0)], ?stor, ?cdp);
+
+rule opCreate := 
+	for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, CREATE)
+	let 	
+		macro #StackSizeCheck := MState{!id,!pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 2
+    in
+    clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		#StackSizeCheck
+		=> MState{!id, !pc + 1}(?size - 2, store ?sa (?size-3) @T, ?mem, [@T], ?cd),
+	clause [?v :AbsDom, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int, ?cdp:int]
+    	#StackSizeCheck, ?cdp > ?cd
+    	=> MState{!id, 0}(0, [@V(0)], [@V(0)], ?stor, ?cdp);
+
+rule opCreate2 := 
+	for (!id: int) in ids(), (!pc:int) in pcsForIdAndOpcode(!id, CREATE2)
+	let 	
+		macro #StackSizeCheck := MState{!id,!pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 3
+    in
+    clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+		#StackSizeCheck
+		=> MState{!id, !pc + 1}(?size - 3, store ?sa (?size-4) @T, ?mem, [@T], ?cd),
+	clause [?v :AbsDom, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int, ?cdp:int]
+    	#StackSizeCheck, ?cdp > ?cd
+    	=> MState{!id, 0}(0, [@V(0)], [@V(0)], ?stor, ?cdp);
+
+/* === 0-ary operations === */
+
+op unitOp(c: Opcode): AbsDom := match c with 
+| @ADDRESS => @T
+| @ORIGIN => @T
+| @CALLDATASIZE => @T
+| @CALLVALUE => @T
+| @CALLER => @T
+| @CODESIZE => @T // Actually, we should not over-approximate this one! We have the data!
+| @GASPRICE => @T
+| @RETURNDATASIZE => @T
+| @COINBASE => @T
+| @TIMESTAMP => @T
+| @NUMBER => @T
+| @DIFFICULTY => @T
+| @GASLIMIT => @T
+| @MSIZE => @T
+| @GAS => @T
+| _ => @T;
+
+rule opUnit :=
+	for (!op: int) in unitOps(), (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, !op) 
+	clause [?size:int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size < 1024 
+		=> MState{!id, !pc +1}(?size + 1, store ?sa ?size (unitOp(intToOpCode(!op))), ?mem, ?stor, ?cd);
+
+/* Special Case PC */
+rule opPc :=
+	for (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, PC) 
+	clause [?size:int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size < 1024 
+		=> MState{!id, !pc +1}(?size + 1, store ?sa ?size @V(!pc), ?mem, ?stor, ?cd);
+
+/* === Copy operations === */
+// CALLDATACOPY, CODECOPY, EXTCODECOPY, RETURNDATACOPY
+
+// TODO: we could try to single out CODECOPY as we have this data statically
+rule opCopy:=
+	for (!op: int) in copyOps(), (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, !op), (!a: int, !b: int) in argumentsTwoForIdAndPc(!id, !pc)
+	clause [?size:int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 2
+		=> MState{!id, !pc +1}(?size - 3, ?sa, [@T], ?stor, ?cd);
+
+rule opExtcodecopy:=
+	for (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, EXTCODECOPY), (!a: int, !b: int) in argumentsTwoForIdAndPc(!id, !pc)
+	clause [?size:int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 3
+		=> MState{!id, !pc +1}(?size - 4, ?sa, [@T], ?stor, ?cd);
+
+/* === Logging operations === */
+rule opLog :=
+	for (!i: int) in interval(0, 5), (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, LOG0 + !i)
+	clause [?size:int, ?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?cd: int]
+		MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size >= 2+!i
+		=> MState{!id, !pc +1}(?size - (!i + 2), ?sa, ?mem, ?stor, ?cd);
+
+ 
+/* === Halting operations === */
+
+rule opHaltAfterLast :=
+    for (!id: int) in ids(), (!pc: int) in lastPcsForId(!id) // TODO what exactly is the !pc here? => the pc after the last (might have some offset due to push, name of the selector function to be changed)
+    clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+        MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd) => Halt{!id}(?stor, ?cd);
+
+rule opHaltOnReturn :=
+    for (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, RETURN) 
+    clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+        MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 1
+        => Halt{!id}(?stor, ?cd);
+
+rule opHaltOnStop :=
+    for (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, STOP)
+    clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+        MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd) => Halt{!id}(?stor, ?cd);
+
+rule opHaltOnSelfdestruct :=
+    for (!id: int) in ids(), (!pc: int) in pcsForIdAndOpcode(!id, SELFDESTRUCT)
+    clause [?sa: array<AbsDom>, ?mem: array<AbsDom>, ?stor: array<AbsDom>, ?size:int, ?cd: int]
+        MState{!id, !pc}(?size, ?sa, ?mem, ?stor, ?cd), ?size > 0
+        => Halt{!id}(?stor, ?cd);
+
+// Note on REVERT AND INVALID: this both opcodes both cause exceptions. REVERT actually returns data and gas, but as we are overapproximating both of these, modelling it as exception is sound
+// However, as there is the general exception rule, both opcodes are captured by it. 
+
+/* === Initialization === */
+
+rule initOp :=
+	for (!id:int) in ids()
+	clause
+		true 
+		=> MState{!id, 0}(0, [@V(0)], [@V(0)], [@T], 0); // execution starts at pc 0 in empty execution state
+
+// TODO: multiple contracts would require additional selector function that singles out the contract under analysis
+
